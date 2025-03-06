@@ -51,7 +51,7 @@ const data = {
 
 const localStorageValues = {
     "headerTolken": JSON.stringify({
-        "tolken": "5f4c4e44534b49534c4a4d534e485f",
+        "tolken": crypto.randomUUID().replace(/-/g, ''),
         "ip": randomIP,
         "expire": Date.now() + (1000 * 60 * 60 * 24 * 365 * 2) // 2 years from now
     }),
