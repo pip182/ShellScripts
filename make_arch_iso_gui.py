@@ -2,7 +2,20 @@
 """
 GUI for creating a live and installable Arch Linux ISO from current
 installation.
-Requires: PyQt6 (install with: pip install PyQt6 or pacman -S python-pyqt6)
+
+Changes in this version:
+- Live ISO boots to GNOME (graphical) by:
+  - Writing /root/customize_airootfs.sh into airootfs (executed by mkarchiso)
+  - Enabling gdm + NetworkManager
+  - Setting default.target to graphical.target
+  - Creating user BEFORE gdm starts, and optional GDM autologin
+- Writes /root/pkglist.txt into the ISO (from the final packages.x86_64 list)
+- Replaces /root/install.sh with a real UEFI installer that:
+  - Wipes selected disk, creates EFI+root partitions
+  - pacstrap using /root/pkglist.txt (if present)
+  - Enables NetworkManager + GDM and installs systemd-boot
+
+Requires: PyQt6 (pip install PyQt6 or pacman -S python-pyqt6)
 """
 
 import sys
@@ -192,7 +205,6 @@ def safe_makedirs(path: str, mode: int = 0o755) -> None:
 
 def get_qt_dialog_code():
     """Get the correct QDialog code constant for PyQt version"""
-    # This will be called after imports, so we check at runtime
     try:
         from PyQt6.QtWidgets import QDialog
         return QDialog.DialogCode.Accepted, QDialog.DialogCode.Rejected
@@ -224,11 +236,237 @@ class ISOBuilderThread(QThread):
         '.steam', '.local/share/Steam',
         'go/pkg', '.cargo/registry',
     ]
+    HOME_COPY_EXCLUDES = [
+        '.cache',
+        '.local/share/Trash',
+        'Downloads',
+        '.mozilla/firefox/*/cache2',
+        '.config/google-chrome/*/Cache',
+        '.config/chromium/*/Cache',
+        '.steam',
+        '.local/share/Steam',
+        'node_modules',
+        '.npm',
+        '.yarn',
+    ]
 
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.process = None
+
+    def _emit(self, message: str) -> None:
+        self.output_signal.emit(message)
+
+    def _write_text(self, path: str, content: str) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8', newline='') as f:
+            f.write(content)
+
+    def _write_script(self, path: str, content: str) -> None:
+        self._write_text(path, content)
+        os.chmod(path, 0o755)
+
+    def _make_rsync_excludes(self, patterns: List[str]) -> List[str]:
+        return [f'--exclude={pattern}' for pattern in patterns]
+
+    def _build_package_list(
+        self,
+        profile_dir: str,
+        packages: List[str],
+        excluded_packages: List[str]
+    ) -> Tuple[str, List[str], int, set]:
+        pkg_file = os.path.join(profile_dir, 'packages.x86_64')
+        if not os.path.exists(pkg_file):
+            self._emit(
+                f"[ERROR] packages.x86_64 not found: {pkg_file}\n"
+            )
+            raise FileNotFoundError("packages.x86_64 not found")
+
+        with open(pkg_file, 'r', encoding='utf-8') as f:
+            base_lines = f.read().splitlines()
+
+        base_packages = []
+        for line in base_lines:
+            stripped = line.strip()
+            if stripped and not stripped.startswith('#'):
+                base_packages.append(stripped)
+
+        base_package_set = set(base_packages)
+
+        required_packages = {
+            'mkinitcpio',
+            'mkinitcpio-archiso',
+            'squashfs-tools',
+            'linux',
+            'linux-firmware',
+            'base',
+        }
+
+        excluded_set = set(excluded_packages)
+        excluded_effective = excluded_set - required_packages
+        excluded_ignored = excluded_set & required_packages
+        if excluded_ignored:
+            self._emit(
+                "[WARN] Ignoring exclusions for required packages: "
+                f"{', '.join(sorted(excluded_ignored))}\n"
+            )
+
+        base_lines_filtered = []
+        for line in base_lines:
+            stripped = line.strip()
+            if stripped and not stripped.startswith('#'):
+                if stripped in excluded_effective:
+                    continue
+            base_lines_filtered.append(line)
+
+        custom_packages = [
+            pkg for pkg in packages
+            if pkg.strip() and pkg not in excluded_effective
+        ]
+        custom_packages = [
+            pkg for pkg in custom_packages
+            if pkg not in base_package_set
+        ]
+        custom_packages = sorted(set(custom_packages))
+
+        required_missing = sorted(
+            required_packages -
+            (set(custom_packages) | base_package_set)
+        )
+        if required_missing:
+            self._emit(
+                "[INFO] Adding required packages missing from base list: "
+                f"{', '.join(required_missing)}\n"
+            )
+
+        with open(pkg_file, 'w', encoding='utf-8', newline='') as f:
+            if base_lines_filtered:
+                f.write("\n".join(base_lines_filtered).rstrip() + "\n")
+            if required_missing or custom_packages:
+                f.write("\n# Added from current system\n")
+                for pkg in required_missing:
+                    f.write(f"{pkg}\n")
+                for pkg in custom_packages:
+                    f.write(f"{pkg}\n")
+
+        with open(pkg_file, 'r', encoding='utf-8') as f:
+            pkg_lines = [
+                line.strip() for line in f.readlines()
+                if line.strip() and not line.strip().startswith('#')
+            ]
+        pkg_count = len(pkg_lines)
+        return pkg_file, pkg_lines, pkg_count, required_packages
+
+    def _write_user_setup_script(
+        self,
+        airootfs: str,
+        iso_username: str,
+        user_password: str,
+        root_password: str,
+        source_user: str = ""
+    ) -> None:
+        setup_path = os.path.join(airootfs, 'root', 'setup_user.sh')
+        lines = [
+            "#!/bin/bash",
+            "# User setup script for ISO",
+            f'USERNAME="{iso_username}"',
+            f'USER_PASSWORD="{user_password}"',
+            f'ROOT_PASSWORD="{root_password}"',
+        ]
+        if source_user:
+            lines.append(f'SOURCE_USER="{source_user}"')
+        lines += [
+            "",
+            "# Set root password",
+            'echo "root:$ROOT_PASSWORD" | chpasswd',
+            "",
+            "# Create user if it doesn't exist",
+            'if ! id -u "$USERNAME" &>/dev/null; then',
+            '    useradd -m -s /bin/bash "$USERNAME"',
+            '    echo "$USERNAME:$USER_PASSWORD" | chpasswd',
+            "    # Add to wheel group for sudo",
+            '    usermod -aG wheel "$USERNAME"',
+            "fi",
+            "",
+        ]
+        if source_user:
+            lines.append('echo "User $USERNAME configured from $SOURCE_USER"')
+        else:
+            lines.append('echo "User $USERNAME created with blank template"')
+        self._write_script(setup_path, "\n".join(lines) + "\n")
+
+    def _write_restore_script(self, airootfs: str, iso_username: str) -> None:
+        restore_path = os.path.join(airootfs, 'root', 'restore_user_home.sh')
+        content = f"""#!/bin/bash
+# Restore user home directory in live environment
+USERNAME="{iso_username}"
+SOURCE_DIR="/etc/skel/user_{iso_username}"
+DEST_HOME="/home/$USERNAME"
+
+if [ -d "$SOURCE_DIR" ] && [ -d "$DEST_HOME" ]; then
+    rsync -a "$SOURCE_DIR/" "$DEST_HOME/"
+    chown -R "$USERNAME:$USERNAME" "$DEST_HOME"
+    echo "User home directory restored for $USERNAME"
+fi
+"""
+        self._write_script(restore_path, content)
+
+    # NEW: this is what actually makes the built ISO boot into GNOME
+    def _write_customize_airootfs(self, airootfs: str, iso_username: str) -> None:
+        customize_path = os.path.join(airootfs, 'root', 'customize_airootfs.sh')
+        content = f"""#!/bin/bash
+set -euo pipefail
+
+echo "[customize_airootfs] running..."
+
+# 1) Create user and set passwords (your script)
+if [[ -x /root/setup_user.sh ]]; then
+  /root/setup_user.sh
+fi
+
+# 2) Populate home from saved template (if present)
+SRC="/etc/skel/user_{iso_username}"
+DST="/home/{iso_username}"
+if [[ -d "$SRC" ]]; then
+  mkdir -p "$DST"
+  rsync -a "$SRC/" "$DST/" || true
+  chown -R "{iso_username}:{iso_username}" "$DST" || true
+fi
+
+# 3) Enable sudo for wheel
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers || true
+
+# 4) Networking
+systemctl enable NetworkManager.service || true
+
+# 5) GNOME Display Manager + graphical boot
+if pacman -Qq gdm &>/dev/null; then
+  systemctl enable gdm.service || true
+
+  # Optional: autologin directly into GNOME
+  mkdir -p /etc/gdm
+  cat > /etc/gdm/custom.conf <<EOF
+[daemon]
+AutomaticLoginEnable=True
+AutomaticLogin={iso_username}
+
+[security]
+
+[xdmcp]
+
+[chooser]
+
+[debug]
+EOF
+fi
+
+# Ensure we boot to graphical target by default
+ln -sf /usr/lib/systemd/system/graphical.target /etc/systemd/system/default.target || true
+
+echo "[customize_airootfs] done."
+"""
+        self._write_script(customize_path, content)
 
     def run(self):
         """Run the ISO build process"""
@@ -245,11 +483,11 @@ class ISOBuilderThread(QThread):
             iso_label = self.config['iso_label']
 
             # Thorough cleanup of previous build to avoid conflicts
-            self.output_signal.emit(
+            self._emit(
                 "[INFO] Cleaning up previous build directories and files...\n"
             )
-            safe_remove(work_dir, self.output_signal.emit)
-            safe_remove(output_dir, self.output_signal.emit)
+            safe_remove(work_dir, self._emit)
+            safe_remove(output_dir, self._emit)
 
             # Clean up any leftover ISO files in output directory parent
             output_parent = os.path.dirname(output_dir) or output_dir
@@ -257,29 +495,29 @@ class ISOBuilderThread(QThread):
                 iso_files = list(Path(output_parent).glob('*.iso'))
                 for iso_file in iso_files:
                     if iso_file.name.startswith(iso_name):
-                        safe_remove(str(iso_file), self.output_signal.emit)
+                        safe_remove(str(iso_file), self._emit)
 
             # Create fresh directories with proper permissions
             safe_makedirs(work_dir)
             safe_makedirs(output_dir)
 
-            self.output_signal.emit(
+            self._emit(
                 "[INFO] Cleanup complete. Starting fresh build.\n"
             )
             self.progress_signal.emit(10)
 
             # Check/install archiso
-            self.output_signal.emit("[INFO] Checking for archiso...\n")
+            self._emit("[INFO] Checking for archiso...\n")
             result = run_command(['pacman', '-Q', 'archiso'])
             if result.returncode != 0:
-                self.output_signal.emit("[WARN] Installing archiso...\n")
+                self._emit("[WARN] Installing archiso...\n")
                 run_command(
                     ['pacman', '-Sy', '--noconfirm', 'archiso'], check=True
                 )
             self.progress_signal.emit(20)
 
             # Copy releng profile (ensure clean copy)
-            self.output_signal.emit(
+            self._emit(
                 "[INFO] Copying archiso releng profile...\n"
             )
             # Remove profile directory if it exists to ensure clean copy
@@ -289,7 +527,7 @@ class ISOBuilderThread(QThread):
             # Verify source profile exists
             source_profile = '/usr/share/archiso/configs/releng/'
             if not os.path.exists(source_profile):
-                self.output_signal.emit(
+                self._emit(
                     f"[ERROR] Source profile not found: {source_profile}\n"
                 )
                 raise FileNotFoundError(
@@ -310,7 +548,7 @@ class ISOBuilderThread(QThread):
             for critical_file in critical_files:
                 file_path = os.path.join(profile_dir, critical_file)
                 if not os.path.exists(file_path):
-                    self.output_signal.emit(
+                    self._emit(
                         f"[ERROR] Critical file missing: {critical_file}\n"
                     )
                     raise FileNotFoundError(
@@ -323,7 +561,7 @@ class ISOBuilderThread(QThread):
             # Copy current system's pacman.conf to include custom repos
             include_custom = self.config.get('include_custom_repos', True)
             if include_custom:
-                self.output_signal.emit(
+                self._emit(
                     "[INFO] Copying system pacman.conf "
                     "(includes custom repos)...\n"
                 )
@@ -333,7 +571,7 @@ class ISOBuilderThread(QThread):
                 )
 
                 # Setup local repository for AUR packages
-                self.output_signal.emit(
+                self._emit(
                     "[INFO] Setting up local repository for AUR packages...\n"
                 )
                 local_repo_dir = os.path.join(
@@ -344,7 +582,7 @@ class ISOBuilderThread(QThread):
             self.progress_signal.emit(30)
 
             # Generate package list
-            self.output_signal.emit(
+            self._emit(
                 "[INFO] Generating package list from current system...\n"
             )
             result = run_command(['pacman', '-Qqe'], check=True)
@@ -354,7 +592,7 @@ class ISOBuilderThread(QThread):
             include_custom = self.config.get('include_custom_repos', True)
 
             if include_custom:
-                self.output_signal.emit(
+                self._emit(
                     "[INFO] Including all packages "
                     "(official + custom repos + AUR)\n"
                 )
@@ -383,7 +621,7 @@ class ISOBuilderThread(QThread):
                 failed_aur_packages = []
 
                 if aur_packages:
-                    self.output_signal.emit(
+                    self._emit(
                         f"[INFO] Copying {len(aur_packages)} AUR packages "
                         "to local repository...\n"
                     )
@@ -413,7 +651,7 @@ class ISOBuilderThread(QThread):
                                     pkg_files,
                                     key=lambda p: p.stat().st_mtime
                                 )[-1]
-                                self.output_signal.emit(
+                                self._emit(
                                     f"  - Copying {pkg_file.name}\n"
                                 )
                                 subprocess.run(
@@ -422,7 +660,7 @@ class ISOBuilderThread(QThread):
                                 )
                                 successfully_copied_aur.append(pkg)
                             else:
-                                self.output_signal.emit(
+                                self._emit(
                                     f"  - [WARN] Package file not found in "
                                     f"cache: {pkg} "
                                     "(will be excluded from ISO)\n"
@@ -432,7 +670,7 @@ class ISOBuilderThread(QThread):
                     # Create repository database only if we have packages
                     pkg_files = list(Path(local_repo_dir).glob('*.pkg.tar.*'))
                     if pkg_files:
-                        self.output_signal.emit(
+                        self._emit(
                             "[INFO] Creating local repository database...\n"
                         )
                         repo_db = os.path.join(
@@ -451,23 +689,19 @@ class ISOBuilderThread(QThread):
                             f.write("SigLevel = Optional TrustAll\n")
                             f.write("Server = file:///opt/local-repo\n")
                     elif aur_packages:
-                        # We tried to copy packages but none were found
-                        self.output_signal.emit(
+                        self._emit(
                             "[WARN] No AUR package files were successfully "
                             "copied to local repository\n"
                         )
 
-                # Only include successfully copied AUR packages + repo packages
-                # Remove failed AUR packages from the final list
                 if failed_aur_packages:
-                    self.output_signal.emit(
+                    self._emit(
                         f"[INFO] Excluding {len(failed_aur_packages)} AUR "
                         "packages that couldn't be found:\n"
                     )
                     for pkg in failed_aur_packages:
-                        self.output_signal.emit(f"  - {pkg}\n")
+                        self._emit(f"  - {pkg}\n")
 
-                # Apply user-specified package exclusions
                 excluded_packages = set(
                     self.config.get('excluded_packages', [])
                 )
@@ -480,19 +714,19 @@ class ISOBuilderThread(QThread):
                         pkg for pkg in successfully_copied_aur
                         if pkg not in excluded_packages
                     ]
-                    self.output_signal.emit(
+                    self._emit(
                         f"[INFO] Excluding {len(excluded_packages)} "
                         "user-specified packages\n"
                     )
 
                 packages = repo_packages + successfully_copied_aur
-                self.output_signal.emit(
+                self._emit(
                     f"[INFO] Final package list: {len(repo_packages)} repo "
                     f"packages + {len(successfully_copied_aur)} AUR packages "
                     f"= {len(packages)} total\n"
                 )
             else:
-                self.output_signal.emit(
+                self._emit(
                     "[INFO] Filtering packages (official repos only)...\n"
                 )
                 packages = []
@@ -523,95 +757,60 @@ class ISOBuilderThread(QThread):
                             aur_packages.append(pkg)
 
                 if aur_packages:
-                    self.output_signal.emit(
+                    self._emit(
                         f"[WARN] Skipping {len(aur_packages)} AUR packages\n"
                     )
                 if distro_packages:
-                    self.output_signal.emit(
+                    self._emit(
                         f"[WARN] Skipping {len(distro_packages)} "
                         "distro-specific packages\n"
                     )
 
-            # Create custom package list
-            pkg_file = os.path.join(profile_dir, 'packages.x86_64')
-            with open(pkg_file, 'w') as f:
-                f.write("""# Base system
-base
-base-devel
-linux
-linux-firmware
-linux-headers
-
-# Bootloader
-grub
-efibootmgr
-os-prober
-syslinux
-
-# Network
-networkmanager
-network-manager-applet
-wpa_supplicant
-dhcpcd
-
-# Utilities
-git
-vim
-nano
-wget
-curl
-rsync
-htop
-man-db
-man-pages
-
-# Archiso requirements
-archinstall
-arch-install-scripts
-
-# Optional but recommended
-edk2-shell
-memtest86+
-memtest86+-efi
-
-""")
-                # Add current packages (filter some out)
-                # Exclude base packages and any user-specified exclusions
-                base_excluded = {
-                    'base', 'linux', 'linux-firmware', 'archiso'
-                }
-                # Add any distro-specific kernel packages
-                user_excluded = set(
-                    self.config.get('excluded_packages', [])
+            # NEW: ensure minimal GNOME + display manager stack exists
+            # (If you already have GNOME installed, this does nothing.)
+            excluded_packages = set(self.config.get('excluded_packages', []))
+            gui_must = [
+                "xorg-server",
+                "gnome-shell",
+                "gnome-session",
+                "gdm",
+                "networkmanager",
+                "mesa",
+            ]
+            added_gui = []
+            for must in gui_must:
+                if must in excluded_packages:
+                    self._emit(
+                        f"[WARN] GUI-required package '{must}' is excluded. "
+                        "Live GNOME may not start.\n"
+                    )
+                    continue
+                if must not in packages and must not in all_packages:
+                    packages.append(must)
+                    added_gui.append(must)
+            if added_gui:
+                self._emit(
+                    "[INFO] Added GUI packages to support GNOME live session: "
+                    f"{', '.join(added_gui)}\n"
                 )
-                excluded = base_excluded | user_excluded
-                # Apply exclusions
-                excluded_packages = set(
-                    self.config.get('excluded_packages', [])
+
+            excluded_packages_list = self.config.get('excluded_packages', [])
+            pkg_file, pkg_lines, pkg_count, required_packages = (
+                self._build_package_list(
+                    profile_dir,
+                    packages,
+                    excluded_packages_list
                 )
-                for pkg in sorted(packages):
-                    if (pkg not in excluded and pkg not in excluded_packages
-                            and pkg.strip()):
-                        f.write(f"{pkg}\n")
+            )
 
-            # Verify package list
-            with open(pkg_file, 'r') as f:
-                pkg_lines = [
-                    line.strip() for line in f.readlines()
-                    if line.strip() and not line.strip().startswith('#')
-                ]
-            pkg_count = len(pkg_lines)
-
-            # Check for critical packages
-            critical_packages = ['base', 'linux', 'linux-firmware']
             missing_critical = []
-            for crit_pkg in critical_packages:
-                if not any(crit_pkg in pkg for pkg in pkg_lines):
+            for crit_pkg in required_packages:
+                if crit_pkg not in pkg_lines:
                     missing_critical.append(crit_pkg)
 
             if missing_critical:
                 missing_str = ', '.join(missing_critical)
-                self.output_signal.emit(
+                self._emit(
                     f"[ERROR] Missing critical packages: {missing_str}\n"
                 )
                 raise ValueError(
@@ -619,30 +818,30 @@ memtest86+-efi
                 )
 
             if pkg_count < 10:
-                self.output_signal.emit(
+                self._emit(
                     f"[WARN] Package list is very small ({pkg_count} "
                     "packages). This may cause boot issues.\n"
                 )
 
-            self.output_signal.emit(
+            self._emit(
                 f"[INFO] Package list created with {pkg_count} packages\n"
             )
-            self.output_signal.emit(f"[INFO] Package list file: {pkg_file}\n")
+            self._emit(f"[INFO] Package list file: {pkg_file}\n")
             self.progress_signal.emit(40)
 
             # Setup directory exclusions for rsync
             exclude_dirs = self.config.get('exclude_dirs', [])
             if exclude_dirs:
-                self.output_signal.emit(
+                self._emit(
                     f"[INFO] Excluding {len(exclude_dirs)} directory "
                     "patterns...\n"
                 )
                 for excl in exclude_dirs:
-                    self.output_signal.emit(f"  - {excl}\n")
+                    self._emit(f"  - {excl}\n")
 
             # Customize airootfs (airootfs contains customization files
             # that get copied into the built rootfs)
-            self.output_signal.emit(
+            self._emit(
                 "[INFO] Customizing live system root filesystem...\n"
             )
             airootfs = os.path.join(profile_dir, 'airootfs')
@@ -658,8 +857,10 @@ memtest86+-efi
                 )
 
             # Set hostname
-            with open(os.path.join(airootfs, 'etc', 'hostname'), 'w') as f:
-                f.write("archiso-live\n")
+            self._write_text(
+                os.path.join(airootfs, 'etc', 'hostname'),
+                "archiso-live\n"
+            )
 
             # Configure user account
             user_config = self.config.get('user_config', {})
@@ -670,71 +871,37 @@ memtest86+-efi
             use_blank_template = user_config.get('use_blank_template', True)
 
             if not use_blank_template and copy_from_user:
-                # Copy home directory from specified user
-                self.output_signal.emit(
+                self._emit(
                     f"[INFO] Configuring user from: {copy_from_user}\n"
                 )
                 source_home = os.path.expanduser(f'~{copy_from_user}')
                 if not os.path.exists(source_home):
-                    self.output_signal.emit(
+                    self._emit(
                         f"[WARN] Home directory not found: {source_home}\n"
                     )
-                    self.output_signal.emit(
+                    self._emit(
                         "[INFO] Falling back to blank template\n"
                     )
                     use_blank_template = True
                 else:
-                    # Create user setup script
-                    user_setup_script = os.path.join(
-                        airootfs, 'root', 'setup_user.sh'
+                    self._write_user_setup_script(
+                        airootfs,
+                        iso_username,
+                        user_password,
+                        root_password,
+                        copy_from_user
                     )
-                    with open(user_setup_script, 'w') as f:
-                        f.write(f"""#!/bin/bash
-# User setup script for ISO
-USERNAME="{iso_username}"
-USER_PASSWORD="{user_password}"
-ROOT_PASSWORD="{root_password}"
-SOURCE_USER="{copy_from_user}"
 
-# Set root password
-echo "root:$ROOT_PASSWORD" | chpasswd
-
-# Create user if it doesn't exist
-if ! id -u "$USERNAME" &>/dev/null; then
-    useradd -m -s /bin/bash "$USERNAME"
-    echo "$USERNAME:$USER_PASSWORD" | chpasswd
-    # Add to wheel group for sudo
-    usermod -aG wheel "$USERNAME"
-fi
-
-# Copy home directory contents (will be done during build)
-# This script runs in the live environment
-echo "User $USERNAME configured from $SOURCE_USER"
-""")
-                    os.chmod(user_setup_script, 0o755)
-
-                    # Copy home directory to airootfs
                     dest_home = os.path.join(
                         airootfs, 'etc', 'skel', f'user_{iso_username}'
                     )
                     os.makedirs(dest_home, exist_ok=True)
 
-                    # Use rsync to copy, excluding certain directories
-                    exclude_patterns = [
-                        '--exclude=.cache',
-                        '--exclude=.local/share/Trash',
-                        '--exclude=Downloads',
-                        '--exclude=.mozilla/firefox/*/cache2',
-                        '--exclude=.config/google-chrome/*/Cache',
-                        '--exclude=.config/chromium/*/Cache',
-                        '--exclude=.steam',
-                        '--exclude=.local/share/Steam',
-                        '--exclude=node_modules',
-                        '--exclude=.npm',
-                        '--exclude=.yarn',
-                    ]
+                    exclude_patterns = self._make_rsync_excludes(
+                        self.HOME_COPY_EXCLUDES
+                    )
 
-                    self.output_signal.emit(
+                    self._emit(
                         f"[INFO] Copying home directory from "
                         f"{source_home}...\n"
                     )
@@ -750,81 +917,182 @@ echo "User $USERNAME configured from $SOURCE_USER"
                         check=False
                     )
                     if result.returncode == 0:
-                        self.output_signal.emit(
+                        self._emit(
                             "[INFO] Home directory copied successfully\n"
                         )
                     else:
-                        self.output_signal.emit(
+                        self._emit(
                             "[WARN] Some files may not have been copied\n"
                         )
 
-                    # Create script to restore home in live environment
-                    restore_script = os.path.join(
-                        airootfs, 'root', 'restore_user_home.sh'
-                    )
-                    with open(restore_script, 'w') as f:
-                        f.write(f"""#!/bin/bash
-# Restore user home directory in live environment
-USERNAME="{iso_username}"
-SOURCE_DIR="/etc/skel/user_{iso_username}"
-DEST_HOME="/home/$USERNAME"
-
-if [ -d "$SOURCE_DIR" ] && [ -d "$DEST_HOME" ]; then
-    rsync -a "$SOURCE_DIR/" "$DEST_HOME/"
-    chown -R "$USERNAME:$USERNAME" "$DEST_HOME"
-    echo "User home directory restored for $USERNAME"
-fi
-""")
-                    os.chmod(restore_script, 0o755)
+                    self._write_restore_script(airootfs, iso_username)
 
             if use_blank_template:
-                # Create blank user template
-                self.output_signal.emit(
+                self._emit(
                     f"[INFO] Creating blank user template: {iso_username}\n"
                 )
-                user_setup_script = os.path.join(
-                    airootfs, 'root', 'setup_user.sh'
+                self._write_user_setup_script(
+                    airootfs,
+                    iso_username,
+                    user_password,
+                    root_password
                 )
-                with open(user_setup_script, 'w') as f:
-                    f.write(f"""#!/bin/bash
-# User setup script for ISO
-USERNAME="{iso_username}"
-USER_PASSWORD="{user_password}"
-ROOT_PASSWORD="{root_password}"
 
-# Set root password
-echo "root:$ROOT_PASSWORD" | chpasswd
+            # NEW: mkarchiso executes customize_airootfs.sh during build
+            # This ensures user exists + gdm enabled + graphical target set
+            self._write_customize_airootfs(airootfs, iso_username)
 
-# Create user if it doesn't exist
-if ! id -u "$USERNAME" &>/dev/null; then
-    useradd -m -s /bin/bash "$USERNAME"
-    echo "$USERNAME:$USER_PASSWORD" | chpasswd
-    # Add to wheel group for sudo
-    usermod -aG wheel "$USERNAME"
-    echo "User $USERNAME created with blank template"
-fi
-""")
-                os.chmod(user_setup_script, 0o755)
+            # Write pkg list into ISO for installer to use
+            self._write_text(
+                os.path.join(airootfs, "root", "pkglist.txt"),
+                "\n".join(pkg_lines) + "\n"
+            )
 
-            # Create installer helper script
+            # Create installer script (UEFI)
             os.makedirs(os.path.join(airootfs, 'root'), exist_ok=True)
             install_script = os.path.join(airootfs, 'root', 'install.sh')
-            with open(install_script, 'w') as f:
-                f.write("""#!/bin/bash
-echo "================================"
-echo "  Arch Linux Installer Helper  "
-echo "================================"
-echo ""
-echo "This is a live environment with your custom packages."
-echo "To install to disk, use: archinstall"
-echo ""
+            self._write_script(install_script, f"""#!/bin/bash
+set -euo pipefail
+
+# Custom Arch installer (UEFI, GPT, EFI+root)
+# WARNING: this wipes the selected disk.
+
+ISO_USER="{iso_username}"
+USER_PASSWORD="{user_password}"
+ROOT_PASSWORD="{root_password}"
+HOSTNAME="arch-custom"
+TIMEZONE="America/Denver"
+LOCALE="en_US.UTF-8"
+
+PKGLIST="/root/pkglist.txt"
+
+echo "========================================"
+echo "  Custom Arch Installer (UEFI, GPT)"
+echo "========================================"
+echo
+lsblk -dpno NAME,SIZE,MODEL | sed 's/^/  /'
+echo
+read -r -p "Install to which disk (e.g. /dev/nvme0n1 or /dev/sda)? " DISK
+if [[ ! -b "$DISK" ]]; then
+  echo "ERROR: $DISK is not a block device"
+  exit 1
+fi
+
+echo
+echo "ABOUT TO WIPE: $DISK"
+read -r -p "Type WIPE to confirm: " CONF
+if [[ "$CONF" != "WIPE" ]]; then
+  echo "Cancelled."
+  exit 0
+fi
+
+# Basic sanity: require UEFI for systemd-boot path
+if [[ ! -d /sys/firmware/efi/efivars ]]; then
+  echo "ERROR: This script expects UEFI boot (no /sys/firmware/efi)."
+  echo "If you need BIOS/GRUB support, modify bootloader section."
+  exit 1
+fi
+
+echo "[1/8] Partitioning..."
+sgdisk --zap-all "$DISK"
+sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI" "$DISK"
+sgdisk -n 2:0:0      -t 2:8300 -c 2:"ROOT" "$DISK"
+partprobe "$DISK"
+sleep 2
+
+# Handle nvme/mmc partition naming
+EFI_PART="${{DISK}}1"
+ROOT_PART="${{DISK}}2"
+if [[ "$DISK" =~ nvme|mmcblk ]]; then
+  EFI_PART="${{DISK}}p1"
+  ROOT_PART="${{DISK}}p2"
+fi
+
+echo "[2/8] Formatting..."
+mkfs.fat -F32 "$EFI_PART"
+mkfs.ext4 -F "$ROOT_PART"
+
+echo "[3/8] Mounting..."
+mount "$ROOT_PART" /mnt
+mkdir -p /mnt/boot
+mount "$EFI_PART" /mnt/boot
+
+echo "[4/8] Installing base system..."
+if [[ ! -f "$PKGLIST" ]]; then
+  echo "WARN: $PKGLIST not found; installing minimal base only."
+  pacstrap -K /mnt base linux linux-firmware networkmanager
+else
+  # Use current live pacman.conf (includes local-repo if you built it)
+  pacstrap -K -C /etc/pacman.conf /mnt $(grep -v '^#' "$PKGLIST" | xargs)
+fi
+
+echo "[5/8] fstab..."
+genfstab -U /mnt >> /mnt/etc/fstab
+
+echo "[6/8] System config (chroot)..."
+arch-chroot /mnt /bin/bash -euo pipefail <<CHROOT
+echo "root:${{ROOT_PASSWORD}}" | chpasswd
+
+ln -sf "/usr/share/zoneinfo/${{TIMEZONE}}" /etc/localtime
+hwclock --systohc
+
+sed -i "s/^#${{LOCALE}}/${{LOCALE}}/" /etc/locale.gen || true
+locale-gen
+echo "LANG=${{LOCALE}}" > /etc/locale.conf
+
+echo "${{HOSTNAME}}" > /etc/hostname
+cat > /etc/hosts <<EOF
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   ${{HOSTNAME}}.localdomain ${{HOSTNAME}}
+EOF
+
+# User
+useradd -m -s /bin/bash "${{ISO_USER}}" || true
+echo "${{ISO_USER}}:${{USER_PASSWORD}}" | chpasswd
+usermod -aG wheel "${{ISO_USER}}"
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers || true
+
+# Services
+systemctl enable NetworkManager.service || true
+if pacman -Qq gdm &>/dev/null; then
+  systemctl enable gdm.service || true
+  mkdir -p /etc/gdm
+  cat > /etc/gdm/custom.conf <<EOF
+[daemon]
+AutomaticLoginEnable=True
+AutomaticLogin=${{ISO_USER}}
+EOF
+fi
+
+# Bootloader: systemd-boot
+bootctl install
+ROOT_UUID=\\$(blkid -s UUID -o value "{'{'}ROOT_PART{'}'}")
+cat > /boot/loader/loader.conf <<EOF
+default arch
+timeout 3
+editor  0
+EOF
+
+cat > /boot/loader/entries/arch.conf <<EOF
+title   Arch Linux (Custom)
+linux   /vmlinuz-linux
+initrd  /initramfs-linux.img
+options root=UUID=\\${{ROOT_UUID}} rw
+EOF
+CHROOT
+
+echo "[7/8] Done. Unmounting..."
+umount -R /mnt
+
+echo "[8/8] Installation complete."
+echo "Reboot when ready."
 """)
-            os.chmod(install_script, 0o755)
             self.progress_signal.emit(50)
 
             # Create custom build hook to exclude directories
             if exclude_dirs:
-                self.output_signal.emit(
+                self._emit(
                     "[INFO] Creating custom build hook for exclusions...\n"
                 )
                 hooks_dir = os.path.join(
@@ -833,13 +1101,12 @@ echo ""
                 os.makedirs(hooks_dir, exist_ok=True)
 
                 exclude_file = os.path.join(profile_dir, 'exclude_dirs.txt')
-                with open(exclude_file, 'w') as f:
-                    for excl in exclude_dirs:
-                        f.write(f"{excl}\n")
+                exclude_text = "\n".join(exclude_dirs).rstrip() + "\n"
+                self._write_text(exclude_file, exclude_text)
 
             # Customize profiledef.sh - preserve original and only update
             # what we need
-            self.output_signal.emit(
+            self._emit(
                 "[INFO] Customizing profile definition...\n"
             )
             profiledef = os.path.join(profile_dir, 'profiledef.sh')
@@ -847,79 +1114,59 @@ echo ""
                 '/usr/share/archiso/configs/releng/profiledef.sh'
             )
 
-            # Verify profiledef.sh exists in copied profile
             if not os.path.exists(profiledef):
-                self.output_signal.emit(
+                self._emit(
                     "[ERROR] profiledef.sh not found in profile!\n"
                 )
                 raise FileNotFoundError("profiledef.sh not found")
 
-            # Read original file from archiso location to ensure we have
-            # pristine version
-            # This ensures we don't have any corruption from previous builds
             if os.path.exists(original_profiledef):
                 with open(original_profiledef, 'r', encoding='utf-8') as f:
                     lines = f.readlines()
             else:
-                # Fallback to copied version if original not found
                 with open(profiledef, 'r', encoding='utf-8') as f:
                     lines = f.readlines()
 
-            # Update specific lines while preserving everything else exactly
-            # This is critical - any change to boot-related configs will
-            # break boot
             updated_lines = []
             for line in lines:
                 stripped = line.strip()
-                # Update iso_name (preserve quotes and format)
                 if stripped.startswith('iso_name='):
                     updated_lines.append(f'iso_name="{iso_name}"\n')
-                # Update iso_label (preserve quotes and format)
                 elif stripped.startswith('iso_label='):
                     updated_lines.append(f'iso_label="{iso_label}"\n')
-                # Update iso_publisher (preserve quotes and format)
                 elif stripped.startswith('iso_publisher='):
                     updated_lines.append('iso_publisher="Custom Arch Linux"\n')
-                # Update iso_application (preserve quotes and format)
                 elif stripped.startswith('iso_application='):
                     updated_lines.append(
                         'iso_application="Custom Arch Linux Live/Install"\n'
                     )
-                # Ensure pacman_conf points to our custom one
                 elif stripped.startswith('pacman_conf='):
                     updated_lines.append('pacman_conf="pacman.conf"\n')
                 else:
-                    # Preserve ALL other lines exactly as they are
-                    # (critical for boot)
-                    # This includes shebang, comments, and all
-                    # boot-critical settings
                     updated_lines.append(line)
 
-            # Write the modified content preserving original encoding
             with open(profiledef, 'w', encoding='utf-8', newline='') as f:
                 f.writelines(updated_lines)
 
-            # Ensure profiledef.sh is executable (required for archiso)
             os.chmod(profiledef, 0o755)
 
-            # Verify the file was written correctly
             if (not os.path.exists(profiledef) or
                     os.path.getsize(profiledef) == 0):
-                self.output_signal.emit(
+                self._emit(
                     "[ERROR] Failed to write profiledef.sh!\n"
                 )
                 raise IOError("profiledef.sh write failed")
             self.progress_signal.emit(60)
 
             # Build the ISO
-            self.output_signal.emit(
+            self._emit(
                 "[INFO] Building ISO (this will take a while)...\n"
             )
-            self.output_signal.emit(
+            self._emit(
                 "[INFO] Note: Some mkinitcpio and GRUB errors during "
                 "package installation are expected and non-fatal.\n"
             )
-            self.output_signal.emit("=" * 60 + "\n")
+            self._emit("=" * 60 + "\n")
 
             build_dir = os.path.join(work_dir, 'build')
             self.process = subprocess.Popen(
@@ -933,17 +1180,8 @@ echo ""
                 bufsize=1
             )
 
-            # Stream output and detect errors
             error_detected = False
-            # Known non-fatal errors that occur during chroot package
-            # installation
             non_fatal_patterns = [
-                "hook 'archiso' cannot be found",
-                "hook 'archiso_loop_mnt' cannot be found",
-                "hook 'archiso_pxe_common' cannot be found",
-                "hook 'archiso_pxe_nbd' cannot be found",
-                "hook 'archiso_pxe_http' cannot be found",
-                "hook 'archiso_pxe_nfs' cannot be found",
                 "/boot/grub/grub.cfg.new: no such file or directory",
                 "running in chroot",
                 "skipped: running in chroot",
@@ -952,29 +1190,25 @@ echo ""
             ]
 
             for line in self.process.stdout:
-                self.output_signal.emit(line)
+                self._emit(line)
                 line_lower = line.lower()
 
-                # Check if this is a known non-fatal error
                 is_non_fatal = any(
                     pattern in line_lower for pattern in non_fatal_patterns
                 )
 
-                # Detect critical errors (but skip non-fatal ones)
                 if not is_non_fatal and any(
                     keyword in line_lower for keyword in
                     ['error:', 'failed', 'fatal:', 'cannot', 'unable']
                 ):
-                    if 'warning' not in line_lower:  # Ignore warnings
+                    if 'warning' not in line_lower:
                         error_detected = True
-                        self.output_signal.emit(f"[ERROR DETECTED] {line}")
+                        self._emit(f"[ERROR DETECTED] {line}")
 
-                # Track squashfs creation
                 if ('squashfs' in line_lower and
                         ('creating' in line_lower or 'created' in line_lower)):
                     self.progress_signal.emit(80)
 
-                # Update progress based on output keywords
                 elif 'iso' in line_lower and 'creating' in line_lower:
                     self.progress_signal.emit(90)
                 elif 'packages' in line_lower and 'installing' in line_lower:
@@ -984,36 +1218,30 @@ echo ""
 
             self.process.wait()
 
-            # Check for ISO file first (most reliable indicator of success)
-            # mkarchiso may exit with non-zero code due to warnings/
-            # non-fatal errors but still successfully create the ISO
             self.progress_signal.emit(100)
             iso_files = list(Path(output_dir).glob('*.iso'))
 
             if iso_files:
                 iso_file = iso_files[0]
-                size = iso_file.stat().st_size / (1024**3)  # GB
-                self.output_signal.emit("\n" + "=" * 60 + "\n")
+                size = iso_file.stat().st_size / (1024**3)
+                self._emit("\n" + "=" * 60 + "\n")
                 if self.process.returncode == 0:
-                    self.output_signal.emit("[SUCCESS] ISO build completed!\n")
+                    self._emit("[SUCCESS] ISO build completed!\n")
                 else:
-                    self.output_signal.emit(
+                    self._emit(
                         "[WARNING] Build completed with warnings/errors, "
                         "but ISO was created.\n"
                     )
-                self.output_signal.emit(f"[INFO] ISO created: {iso_file}\n")
-                self.output_signal.emit(f"[INFO] Size: {size:.2f} GB\n")
+                self._emit(f"[INFO] ISO created: {iso_file}\n")
+                self._emit(f"[INFO] Size: {size:.2f} GB\n")
 
-                # Verify build artifacts (squashfs may be in build dir or ISO)
-                self.output_signal.emit(
+                self._emit(
                     "\n[INFO] Verifying build artifacts...\n"
                 )
                 squashfs_found = False
 
-                # Check build directory first
                 squashfs_files = list(Path(build_dir).rglob('*.squashfs'))
                 if not squashfs_files:
-                    # Also check in output_dir/arch
                     arch_dir = os.path.join(output_dir, 'arch')
                     if os.path.exists(arch_dir):
                         squashfs_files = list(
@@ -1024,69 +1252,61 @@ echo ""
                     squashfs_size = (
                         squashfs_files[0].stat().st_size / (1024**3)
                     )
-                    self.output_signal.emit(
+                    self._emit(
                         f"[INFO] Squashfs found in build dir: "
                         f"{squashfs_files[0]} ({squashfs_size:.2f} GB)\n"
                     )
                     squashfs_found = True
 
-                    # Verify squashfs is not empty/corrupted
-                    if squashfs_size < 0.1:  # Less than 100MB is suspicious
-                        self.output_signal.emit(
+                    if squashfs_size < 0.1:
+                        self._emit(
                             "[WARN] Squashfs file is very small - may be "
                             "corrupted or empty!\n"
                         )
                 else:
-                    # Squashfs not in build dir - check if it's in the ISO
-                    self.output_signal.emit(
+                    self._emit(
                         "[INFO] Squashfs not found in build directory. "
                         "Checking ISO contents...\n"
                     )
-                    # If ISO is reasonable size (>1GB), assume squashfs is
-                    # embedded (which is normal)
                     if size > 1.0:
-                        self.output_signal.emit(
+                        self._emit(
                             "[INFO] ISO size is reasonable. Squashfs is "
                             "likely embedded in the ISO (normal behavior).\n"
                         )
                         squashfs_found = True
                     else:
-                        self.output_signal.emit(
+                        self._emit(
                             "[WARN] ISO size is suspiciously small. "
                             "Squashfs may be missing.\n"
                         )
 
-                # Final verification: check if ISO contains boot files
-                self.output_signal.emit("[INFO] Verifying ISO structure...\n")
+                self._emit("[INFO] Verifying ISO structure...\n")
                 try:
-                    # Try to list ISO contents
                     result = run_command(['file', str(iso_file)], check=False)
                     if result.returncode == 0:
-                        self.output_signal.emit(
+                        self._emit(
                             f"[INFO] ISO file type: "
                             f"{result.stdout.strip()}\n"
                         )
-                        # Check if it's a valid ISO9660 filesystem
                         is_valid = (
                             'ISO 9660' in result.stdout or
                             'bootable' in result.stdout.lower()
                         )
                         if is_valid:
-                            self.output_signal.emit(
+                            self._emit(
                                 "[INFO] ISO appears to be a valid bootable "
                                 "image.\n"
                             )
                 except Exception:
                     pass
 
-                # Only fail if ISO is too small AND no squashfs found
                 if not squashfs_found and size < 1.0:
-                    self.output_signal.emit(
+                    self._emit(
                         "[ERROR] Build verification failed: ISO is too small "
                         "and squashfs not found.\n"
                     )
                     if error_detected:
-                        self.output_signal.emit(
+                        self._emit(
                             "[ERROR] Errors were detected in mkarchiso output "
                             "(see above)\n"
                         )
@@ -1097,23 +1317,22 @@ echo ""
 
                 self.finished_signal.emit(True, str(iso_file))
             else:
-                # No ISO file found - build definitely failed
                 if self.process.returncode == 0:
-                    self.output_signal.emit(
+                    self._emit(
                         "\n[ERROR] Build process completed but ISO file "
                         "not found!\n"
                     )
-                    self.output_signal.emit(
+                    self._emit(
                         f"[ERROR] Check build directory: {build_dir}\n"
                     )
-                    self.output_signal.emit(
+                    self._emit(
                         f"[ERROR] Check output directory: {output_dir}\n"
                     )
                     self.finished_signal.emit(
                         False, "ISO file not found in output directory"
                     )
                 else:
-                    self.output_signal.emit(
+                    self._emit(
                         f"\n[ERROR] ISO build failed! "
                         f"(exit code: {self.process.returncode})\n"
                     )
@@ -1124,7 +1343,7 @@ echo ""
                     )
 
         except Exception as e:
-            self.output_signal.emit(f"\n[ERROR] {str(e)}\n")
+            self._emit(f"\n[ERROR] {str(e)}\n")
             self.finished_signal.emit(False, str(e))
 
     def stop(self):
@@ -1145,10 +1364,12 @@ class USBWriterThread(QThread):
         self.device = device
         self.process = None
 
+    def _emit(self, message: str) -> None:
+        self.output_signal.emit(message)
+
     def run(self):
         """Write ISO to USB device"""
         try:
-            # Check if running as root
             if os.geteuid() != 0:
                 self.finished_signal.emit(
                     False,
@@ -1156,40 +1377,36 @@ class USBWriterThread(QThread):
                 )
                 return
 
-            # Verify device exists
             if not os.path.exists(self.device):
                 self.finished_signal.emit(
                     False, f"Error: Device {self.device} does not exist"
                 )
                 return
 
-            # Get ISO size
             iso_size = os.path.getsize(self.iso_path)
             iso_size_gb = iso_size / (1024**3)
 
-            self.output_signal.emit(
+            self._emit(
                 f"\n[INFO] Writing ISO to USB device: {self.device}\n"
             )
-            self.output_signal.emit(
+            self._emit(
                 f"[INFO] ISO size: {iso_size_gb:.2f} GB\n"
             )
-            self.output_signal.emit(
+            self._emit(
                 f"[WARN] This will erase all data on {self.device}!\n"
             )
-            self.output_signal.emit(
+            self._emit(
                 "[INFO] Writing... (this may take several minutes)\n"
             )
             self.progress_signal.emit(10)
 
-            # Unmount the device if mounted
-            self.output_signal.emit(
+            self._emit(
                 "[INFO] Unmounting device partitions...\n"
             )
             result = run_command(
                 ['umount', '-f', self.device + '*'], check=False
             )
             if result.returncode != 0:
-                # Try individual partitions
                 for part_num in range(1, 10):
                     part = f"{self.device}{part_num}"
                     if os.path.exists(part):
@@ -1197,8 +1414,7 @@ class USBWriterThread(QThread):
 
             self.progress_signal.emit(20)
 
-            # Write ISO using dd
-            self.output_signal.emit(
+            self._emit(
                 f"[INFO] Writing ISO to {self.device}...\n"
             )
             self.process = subprocess.Popen(
@@ -1212,10 +1428,8 @@ class USBWriterThread(QThread):
                 bufsize=1
             )
 
-            # Stream output
             for line in self.process.stdout:
-                self.output_signal.emit(line)
-                # Update progress (rough estimate)
+                self._emit(line)
                 if 'records in' in line or 'records out' in line:
                     self.progress_signal.emit(60)
                 elif 'copied' in line.lower():
@@ -1225,24 +1439,24 @@ class USBWriterThread(QThread):
 
             if self.process.returncode == 0:
                 self.progress_signal.emit(100)
-                self.output_signal.emit(
+                self._emit(
                     "\n[SUCCESS] ISO written to USB device successfully!\n"
                 )
-                self.output_signal.emit(f"[INFO] Device: {self.device}\n")
-                self.output_signal.emit(
+                self._emit(f"[INFO] Device: {self.device}\n")
+                self._emit(
                     "[INFO] You can now boot from this USB drive.\n"
                 )
                 self.finished_signal.emit(
                     True, f"ISO written to {self.device}"
                 )
             else:
-                self.output_signal.emit(
+                self._emit(
                     "\n[ERROR] Failed to write ISO to USB device!\n"
                 )
                 self.finished_signal.emit(False, "USB write process failed")
 
         except Exception as e:
-            self.output_signal.emit(f"\n[ERROR] {str(e)}\n")
+            self._emit(f"\n[ERROR] {str(e)}\n")
             self.finished_signal.emit(False, str(e))
 
     def stop(self):
@@ -1488,60 +1702,54 @@ class PackageSelectionDialog(QDialog):
             'Filter packages by name...'
         )
         self.search_input.textChanged.connect(self.filter_packages)
-        self.search_input.setEnabled(False)  # Disable until loaded
+        self.search_input.setEnabled(False)
         search_layout.addWidget(self.search_input)
         layout.addLayout(search_layout)
 
-        # Packages list
         self.package_list = QListWidget()
         self.package_list.setMinimumHeight(400)
         layout.addWidget(self.package_list)
 
-        # Initialize package data
         self.all_packages = []
         self.aur_packages = set()
         self.excluded_packages = excluded_packages or []
 
-        # Start loading packages in background thread
         self.loader_thread = None
         self.start_loading_packages()
 
-        # Buttons for managing packages
         btn_layout = QHBoxLayout()
 
         self.select_all_btn = QPushButton('Select All')
         self.select_all_btn.clicked.connect(self.select_all_packages)
-        self.select_all_btn.setEnabled(False)  # Disable until loaded
+        self.select_all_btn.setEnabled(False)
         btn_layout.addWidget(self.select_all_btn)
 
         self.deselect_all_btn = QPushButton('Deselect All')
         self.deselect_all_btn.clicked.connect(self.deselect_all_packages)
-        self.deselect_all_btn.setEnabled(False)  # Disable until loaded
+        self.deselect_all_btn.setEnabled(False)
         btn_layout.addWidget(self.deselect_all_btn)
 
         self.select_aur_btn = QPushButton('Select All AUR')
         self.select_aur_btn.clicked.connect(self.select_all_aur)
-        self.select_aur_btn.setEnabled(False)  # Disable until loaded
+        self.select_aur_btn.setEnabled(False)
         btn_layout.addWidget(self.select_aur_btn)
 
         self.deselect_aur_btn = QPushButton('Deselect All AUR')
         self.deselect_aur_btn.clicked.connect(self.deselect_all_aur)
-        self.deselect_aur_btn.setEnabled(False)  # Disable until loaded
+        self.deselect_aur_btn.setEnabled(False)
         btn_layout.addWidget(self.deselect_aur_btn)
 
         layout.addLayout(btn_layout)
 
-        # Status label
         self.status_label = QLabel('')
         layout.addWidget(self.status_label)
 
-        # Dialog buttons
         dialog_btn_layout = QHBoxLayout()
         dialog_btn_layout.addStretch()
 
         self.ok_btn = QPushButton('OK')
         self.ok_btn.clicked.connect(self.accept)
-        self.ok_btn.setEnabled(False)  # Disable until loaded
+        self.ok_btn.setEnabled(False)
         dialog_btn_layout.addWidget(self.ok_btn)
 
         cancel_btn = QPushButton('Cancel')
@@ -1761,13 +1969,6 @@ class ISOBuilderGUI(QMainWindow):
             LayoutSpacing.MAIN_MARGINS,
             LayoutSpacing.MAIN_MARGINS
         )
-
-        # # Title
-        # title = QLabel('Create Custom Arch Linux Live ISO')
-        # title.setFont(QFont('Arial', 12, QFont.Weight.Bold))
-        # title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        # title.setContentsMargins(0, 0, 0, 5)
-        # main_layout.addWidget(title)
 
         # Configuration Group
         config_group = QGroupBox('Configuration')
@@ -2272,13 +2473,11 @@ class ISOBuilderGUI(QMainWindow):
 
     def on_user_template_changed(self, state):
         """Handle user template option changes"""
-        # CheckState.Checked is 2 in both PyQt5 and PyQt6
         checked = (
             state == Qt.CheckState.Checked.value if HAS_PYQT6 else state == 2
         )
 
         sender = self.sender()
-        # If called manually (no sender), determine which checkbox is checked
         if sender == self.user_template_blank or (
                 sender is None and self.user_template_blank.isChecked()):
             if checked:
@@ -2300,16 +2499,13 @@ class ISOBuilderGUI(QMainWindow):
 
     def on_usb_write_toggled(self, state):
         """Enable/disable USB device selection based on checkbox"""
-        # CheckState.Checked is 2 in both PyQt5 and PyQt6
         enabled = (
             state == Qt.CheckState.Checked.value if HAS_PYQT6 else state == 2
         )
         self.usb_device_combo.setEnabled(enabled)
-        # Use stored refresh button reference if available
         if hasattr(self, 'refresh_usb_btn'):
             self.refresh_usb_btn.setEnabled(enabled)
         else:
-            # Fallback: find refresh button
             for widget in self.findChildren(QPushButton):
                 if widget.text() == 'Refresh':
                     widget.setEnabled(enabled)
@@ -2317,7 +2513,6 @@ class ISOBuilderGUI(QMainWindow):
         if enabled and self.usb_device_combo.count() == 0:
             self.refresh_usb_devices()
         elif enabled:
-            # Refresh devices when enabled
             self.refresh_usb_devices()
 
     def show_exclusions_dialog(self):
@@ -2327,7 +2522,6 @@ class ISOBuilderGUI(QMainWindow):
         result = dialog.exec()
 
         if result == accepted:
-            # Update the exclusions list with all items from dialog
             self.exclude_list_items = dialog.get_all_exclusions()
 
     def show_package_selection_dialog(self):
@@ -2337,15 +2531,12 @@ class ISOBuilderGUI(QMainWindow):
         result = dialog.exec()
 
         if result == accepted:
-            # Update the excluded packages list
             self.excluded_packages = dialog.get_excluded_packages()
-            # Save to settings
             self.settings['excluded_packages'] = self.excluded_packages
             self.save_settings()
 
     def get_selected_exclusions(self):
         """Get list of checked exclusion patterns"""
-        # Return only checked items
         return [
             pattern for pattern, checked in self.exclude_list_items.items()
             if checked
@@ -2387,11 +2578,10 @@ class ISOBuilderGUI(QMainWindow):
         if not self.check_root():
             return
 
-        # Prepare configuration
         date_str = subprocess.check_output(
             ['date', '+%Y%m'], text=True
         ).strip()
-        # Prepare user configuration
+
         user_config = {
             'iso_username': self.iso_username_input.text(),
             'user_password': self.user_password_input.text(),
@@ -2682,14 +2872,10 @@ def main():
 
     app.setPalette(dark_palette)
 
-    # Modern dark theme stylesheet using Colors constants
     app.setStyleSheet(f"""
-        /* Main window */
         QMainWindow {{
             background-color: {Colors.BG_PRIMARY};
         }}
-
-        /* Tooltips */
         QToolTip {{
             color: {Colors.TOOLTIP_TEXT};
             background-color: {Colors.TOOLTIP_BG};
@@ -2697,8 +2883,6 @@ def main():
             border-radius: 4px;
             padding: 4px 8px;
         }}
-
-        /* Group boxes */
         QGroupBox {{
             border: 1px solid {Colors.BORDER_DEFAULT};
             border-radius: 6px;
@@ -2720,8 +2904,6 @@ def main():
             border-right: 1px solid {Colors.BORDER_DEFAULT};
             padding-top: 6px;
         }}
-
-        /* Buttons */
         QPushButton {{
             background-color: {Colors.BG_BUTTON};
             color: {Colors.TEXT_PRIMARY};
@@ -2743,8 +2925,6 @@ def main():
             border: 1px solid {Colors.BORDER_FOCUS};
             outline: none;
         }}
-
-        /* Special button styles */
         QPushButton#buildButton {{
             background-color: {Colors.BUTTON_SUCCESS};
             border: 1px solid {Colors.BUTTON_SUCCESS_BORDER};
@@ -2779,8 +2959,6 @@ def main():
             background-color: {Colors.BUTTON_ERROR_PRESSED};
             border: 1px solid {Colors.BUTTON_ERROR_BORDER};
         }}
-
-        /* Input fields */
         QLineEdit {{
             background-color: {Colors.BG_SECONDARY};
             color: {Colors.TEXT_PRIMARY};
@@ -2797,8 +2975,6 @@ def main():
         QLineEdit:hover {{
             border: 1px solid {Colors.BORDER_HOVER};
         }}
-
-        /* Combo boxes */
         QComboBox {{
             background-color: {Colors.BG_SECONDARY};
             color: {Colors.TEXT_PRIMARY};
@@ -2835,8 +3011,6 @@ def main():
             selection-background-color: {Colors.SELECTION_BG};
             selection-color: {Colors.SELECTION_TEXT};
         }}
-
-        /* List widgets */
         QListWidget {{
             background-color: {Colors.BG_SECONDARY};
             color: {Colors.TEXT_PRIMARY};
@@ -2856,8 +3030,6 @@ def main():
             background-color: {Colors.SELECTION_BG};
             color: {Colors.SELECTION_TEXT};
         }}
-
-        /* Checkboxes */
         QCheckBox {{
             color: {Colors.TEXT_PRIMARY};
             spacing: 8px;
@@ -2868,7 +3040,6 @@ def main():
             border: 2px solid {Colors.CHECKBOX_BORDER};
             border-radius: 3px;
             background-color: {Colors.BG_SECONDARY};
-
         }}
         QCheckBox::indicator:hover {{
             border: 2px solid {Colors.CHECKBOX_BORDER_HOVER};
@@ -2879,18 +3050,9 @@ def main():
             border: 2px solid {Colors.CHECKBOX_CHECKED};
             image: none;
         }}
-        QCheckBox::indicator:checked::after {{
-            content: "✓";
-            color: white;
-            font-weight: bold;
-        }}
-
-        /* Labels */
         QLabel {{
             color: {Colors.TEXT_PRIMARY};
         }}
-
-        /* Progress bar */
         QProgressBar {{
             background-color: {Colors.PROGRESS_BG};
             border: 1px solid {Colors.BORDER_DEFAULT};
@@ -2903,8 +3065,6 @@ def main():
             background-color: {Colors.PROGRESS_CHUNK};
             border-radius: 3px;
         }}
-
-        /* Text edit / log output */
         QTextEdit {{
             background-color: {Colors.BG_DARKEST};
             color: {Colors.TEXT_SECONDARY};
@@ -2914,8 +3074,6 @@ def main():
             selection-color: {Colors.SELECTION_TEXT};
             font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
         }}
-
-        /* Scrollbars */
         QScrollBar:vertical {{
             background-color: {Colors.SCROLLBAR_BG};
             width: 12px;
@@ -2950,17 +3108,11 @@ def main():
         QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
             width: 0px;
         }}
-
-        /* Disabled widget styling */
         QComboBox:disabled {{
             background-color: {Colors.BG_DISABLED};
             color: {Colors.TEXT_DISABLED};
             border: 1px dashed {Colors.BORDER_DISABLED};
             opacity: 0.6;
-        }}
-        QComboBox:disabled::drop-down {{
-            border: none;
-            background-color: transparent;
         }}
         QPushButton:disabled {{
             background-color: {Colors.BG_DISABLED};
@@ -2983,10 +3135,6 @@ def main():
         QCheckBox:disabled {{
             color: {Colors.TEXT_DISABLED};
             opacity: 0.6;
-        }}
-        QCheckBox:disabled::indicator {{
-            border: 1px dashed {Colors.BORDER_DISABLED};
-            background-color: {Colors.BG_DISABLED};
         }}
         QLabel:disabled {{
             color: {Colors.TEXT_DISABLED};
